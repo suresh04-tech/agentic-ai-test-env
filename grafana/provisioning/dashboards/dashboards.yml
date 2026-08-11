@@ -1,0 +1,18 @@
+# Dashboard provider: loads every .json file in this directory at startup and
+# re-checks periodically. Non-JSON files (like this one) are ignored.
+
+apiVersion: 1
+
+providers:
+  - name: meyiconnect-rca
+    orgId: 1
+    folder: Meyiconnect RCA
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    # Allow edits in the UI for exploration. Note that edits are overwritten
+    # when the file on disk changes — commit real changes to the JSON.
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

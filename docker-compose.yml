@@ -1,12 +1,28 @@
-# Application only.
+# Single Compose application: the test app behind Nginx, plus the full
+# observability stack (Prometheus, Loki, Alloy, Grafana, node-exporter).
 #
-# Prometheus, Loki, Alloy and Grafana are deliberately NOT here — they are
-# maintained as a separate observability stack. This compose file just runs the
-# app and makes it scrapeable.
+# Everything lives in this one repository and this one compose file, so a
+# `git pull && docker compose up -d --build` on EC2 brings up the whole
+# environment with no manual configuration steps.
 #
-# The app's PostgreSQL database is external; configure it in .env.
+# The app's PostgreSQL database stays external; configure it in .env.
+#
+# Traffic paths:
+#   Internet -> nginx:80 -> app:8080 -> external PostgreSQL   (unchanged)
+#   prometheus -> test-rca-app:8080/metrics
+#   app stdout -> Docker json-file -> alloy -> loki
+#   grafana -> prometheus + loki
+#
+# Exposure: only nginx (80) and Grafana (3000) are reachable from outside the
+# host. Prometheus and Loki bind to 127.0.0.1 only; node-exporter and Alloy
+# publish nothing at all.
 
 services:
+  # ==========================================================================
+  # EXISTING SERVICES — behaviour unchanged.
+  # The only edit is joining the `observability` network so Prometheus and
+  # Alloy can reach the app by name.
+  # ==========================================================================
   nginx:
     image: nginx:alpine
     container_name: test-rca-nginx
@@ -17,6 +33,8 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - app
+    networks:
+      - observability
 
   app:
     build: .
@@ -28,12 +46,13 @@ services:
     # Nothing sensitive is committed — see .env.example.
     env_file:
       - .env
-    # App port is no longer exposed directly to the host, 
+    # App port is no longer exposed directly to the host,
     # it is accessed through the nginx reverse proxy.
 
     # Docker's json-file driver writes container stdout to disk, which is what
     # Grafana Alloy tails and forwards to Loki. The labels below give Alloy
     # stable metadata to promote into Loki labels.
+    # Unchanged — `docker logs test-rca-app` keeps working exactly as before.
     logging:
       driver: json-file
       options:
@@ -62,18 +81,174 @@ services:
           cpus: "1.5"
           memory: 512M
 
-# If you prefer Prometheus to scrape the app over a Docker network instead of
-# the host port, create the network once on the EC2 host:
-#
-#     docker network create observability
-#
-# then uncomment the two blocks below and add the same external network to the
-# observability stack's compose file. Prometheus can then scrape
-# http://test-rca-app:8080/metrics by container name.
-#
-#     networks:
-#       - observability
-#
-# networks:
-#   observability:
-#     external: true
+    networks:
+      observability:
+        # Prometheus scrapes `test-rca-app:8080`. Docker resolves container_name
+        # on a user-defined network, and this alias guarantees the target keeps
+        # resolving even if container_name ever changes.
+        aliases:
+          - test-rca-app
+
+    # Deliberately NO depends_on for the observability stack: the application
+    # must start and serve traffic whether or not Prometheus, Loki, Alloy, or
+    # Grafana are running.
+
+  # ==========================================================================
+  # NEW — OBSERVABILITY STACK
+  # ==========================================================================
+
+  # Scrapes the application's /metrics and node-exporter. Bound to localhost
+  # only: reach it via an SSH tunnel, not the public internet.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      # Needed for `docker compose kill -s SIGHUP prometheus` config reloads.
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    networks:
+      - observability
+
+  # Log store. Bound to localhost only; auth is disabled, so it must never be
+  # published publicly.
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3100/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 5
+    networks:
+      - observability
+
+  # Collects Docker container stdout/stderr and pushes it to Loki.
+  # This is Grafana Alloy, not the deprecated Grafana Agent.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    container_name: alloy
+    restart: unless-stopped
+    # Runs as root because it needs to read /var/run/docker.sock, which is
+    # owned by root:docker on the host. This is the pattern Grafana documents
+    # for Docker log collection. It is NOT a privileged container.
+    # Alternative if you prefer non-root: drop `user` and add
+    #   group_add: ["<the host's docker group gid>"]
+    # (gid differs per AMI, which is why it is not hardcoded here).
+    user: root
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Read-only mount. Note honestly: :ro protects the socket *file*, but any
+      # process that can talk to the Docker API through it still has broad
+      # control of the daemon. Acceptable for a test environment; use a
+      # socket-proxy if this ever graduates to production.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      # Diagnostics UI + /metrics. Not published to the host; Prometheus
+      # reaches it over the Docker network.
+      - --server.http.listen-addr=0.0.0.0:12345
+    depends_on:
+      - loki
+    networks:
+      - observability
+
+  # EC2 host metrics: CPU, memory, disk, filesystem, network, load.
+  # No host port published — Prometheus reaches it over the Docker network only.
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    container_name: node-exporter
+    restart: unless-stopped
+    # Host PID namespace so process/host metrics are accurate. Not privileged.
+    pid: host
+    volumes:
+      # Read-only host mounts required to read real host metrics rather than
+      # the container's own namespaced view.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      # Skip pseudo/container filesystems so the disk panel shows real volumes.
+      - "--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|rootfs/(dev|proc|sys|run))($$|/)"
+      - "--collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|cgroup.?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|nsfs|overlay|proc|procfs|pstore|squashfs|sysfs|tracefs)$$"
+    networks:
+      - observability
+
+  # The externally accessible observability UI. Datasources and the RCA
+  # dashboard are provisioned from this repository at startup.
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    # NOTE: intentionally NOT `env_file: .env` — that file holds the external
+    # PostgreSQL credential, which must never be injected into Grafana. Only
+    # the two Grafana variables are interpolated from .env by Compose.
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_LOG_LEVEL: "info"
+    volumes:
+      # Persists users, settings, and any UI-created dashboards.
+      - grafana_data:/var/lib/grafana
+      # Datasource + dashboard provisioning, read-only.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - observability
+
+# All services share one Compose-managed bridge network, so every container
+# resolves every other by name. Compose creates and removes it with the project
+# — no `docker network create` step on EC2.
+networks:
+  observability:
+    driver: bridge
+
+# Named volumes survive `docker compose down`. Only `docker compose down -v`
+# deletes them.
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  alloy_data:

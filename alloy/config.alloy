@@ -1,0 +1,102 @@
+// Grafana Alloy — Docker container logs -> Loki.
+//
+// Pipeline:
+//   test-rca-app stdout -> Docker json-file driver -> Alloy -> Loki -> Grafana
+//
+// The application keeps logging structured JSON to stdout and keeps using the
+// json-file driver, so `docker logs test-rca-app` works exactly as before.
+// Alloy only reads; it changes nothing about how the app logs.
+//
+// This is Alloy (the current agent), not the deprecated Grafana Agent.
+
+// ---------------------------------------------------------------------------
+// Discover every container on this Docker host.
+// ---------------------------------------------------------------------------
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+// ---------------------------------------------------------------------------
+// Turn Docker metadata into Loki labels.
+//
+// Label discipline is the whole game here. Every label below is bounded: a
+// container name, a fixed service/environment/component value, a constant
+// project. Nothing derived from request content becomes a label — no user id,
+// email, request id, URL, or SQL text — because each distinct label value
+// creates a separate Loki stream. Those high-cardinality fields are already in
+// the JSON log body, where LogQL can filter on them after parsing:
+//
+//   {service="test-rca-app"} | json | error_type="connection_refused"
+// ---------------------------------------------------------------------------
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.containers.targets
+
+  // Docker reports names as "/test-rca-app"; strip the leading slash.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "container"
+  }
+
+  // These three come from the `labels:` block on the app service in
+  // docker-compose.yml. Containers without them simply get no such label:
+  // relabeling drops empty label values.
+  rule {
+    source_labels = ["__meta_docker_container_label_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_environment"]
+    target_label  = "environment"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_component"]
+    target_label  = "component"
+  }
+
+  // Constant, so every stream from this environment is attributable.
+  rule {
+    target_label = "project"
+    replacement  = "meyiconnect-rca"
+  }
+
+  // Which stream the line came from (stdout/stderr) is useful and bounded.
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tail the discovered containers and forward to Loki.
+// ---------------------------------------------------------------------------
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.docker_logs.output
+  forward_to       = [loki.write.default.receiver]
+  refresh_interval = "10s"
+}
+
+// ---------------------------------------------------------------------------
+// Ship to Loki over the Docker network.
+//
+// Alloy buffers on disk (--storage.path) and retries, so a Loki restart costs
+// delivery delay rather than lost logs.
+// ---------------------------------------------------------------------------
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alloy's own diagnostics, scraped by Prometheus as job "alloy".
+// Lets you prove the log pipeline is alive rather than infer it from silence.
+// ---------------------------------------------------------------------------
+logging {
+  level  = "info"
+  format = "logfmt"
+}

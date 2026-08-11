@@ -1,0 +1,80 @@
+# Prometheus scrape configuration for the Phase-1 RCA test environment.
+#
+# All targets are addressed by Docker DNS name on the `observability` network —
+# never by EC2 public IP and never by localhost. Inside a container, localhost
+# is the container itself, so `localhost:8080` would scrape Prometheus, not the
+# application.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+  # Attached to every series. Gives the future RCA agent a way to tell this
+  # environment apart from any other Prometheus it is pointed at.
+  external_labels:
+    environment: test
+    project: meyiconnect-rca
+
+scrape_configs:
+  # ------------------------------------------------------------------
+  # The application under test.
+  #
+  # `test-rca-app` is the container_name, which Docker's embedded DNS
+  # resolves on a user-defined network. The compose file also registers it
+  # as an explicit network alias, so this target keeps resolving even if the
+  # container_name changes.
+  # ------------------------------------------------------------------
+  - job_name: test-rca-app
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - test-rca-app:8080
+        labels:
+          service: test-rca-app
+          environment: test
+          component: application
+
+  # ------------------------------------------------------------------
+  # EC2 host metrics (CPU, memory, disk, filesystem, network, load).
+  # Not published to any host port — reachable only over the Docker network.
+  # ------------------------------------------------------------------
+  - job_name: node-exporter
+    static_configs:
+      - targets:
+          - node-exporter:9100
+        labels:
+          service: node-exporter
+          environment: test
+          component: host
+
+  # ------------------------------------------------------------------
+  # Self-monitoring for the observability stack itself. Without these, a
+  # broken log pipeline looks identical to "no logs were produced".
+  # ------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+        labels:
+          service: prometheus
+          environment: test
+          component: observability
+
+  - job_name: loki
+    static_configs:
+      - targets:
+          - loki:3100
+        labels:
+          service: loki
+          environment: test
+          component: observability
+
+  - job_name: alloy
+    static_configs:
+      - targets:
+          - alloy:12345
+        labels:
+          service: alloy
+          environment: test
+          component: observability

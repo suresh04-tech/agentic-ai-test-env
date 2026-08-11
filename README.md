@@ -1,16 +1,27 @@
-# test-rca-app
+# agentic-ai-test-env
 
-A controlled observability / RCA test application for the **Meyiconnect Agentic
+A controlled observability / RCA test environment for the **Meyiconnect Agentic
 AI** project (GENAIPR-002, Phase 1).
 
-It looks and behaves like a small customer web application — FastAPI over
-PostgreSQL — but its real job is to emit **Prometheus metrics** and **structured
-JSON logs** that tell a coherent story, and to fail **on demand, safely, in four
-distinct ways**.
+This single repository contains **both halves** of the environment:
+
+- **The application under test** (`test-rca-app`) — FastAPI over PostgreSQL,
+  behind Nginx. It looks and behaves like a small customer web application, but
+  its real job is to emit **Prometheus metrics** and **structured JSON logs**
+  that tell a coherent story, and to fail **on demand, safely, in four distinct
+  ways**.
+- **The observability stack** — Prometheus, Loki, Grafana Alloy, Grafana, and
+  node-exporter, all in the same `docker-compose.yml`, so one
+  `docker compose up -d --build` brings up everything.
+
+Read it in two parts: **Part A** (sections 1–24) documents the application;
+**Part B** (sections 25–46) documents the observability stack.
 
 ---
 
 ## Table of contents
+
+**Part A — The application**
 
 1. [What this application is](#1-what-this-application-is)
 2. [Why it exists](#2-why-it-exists)
@@ -36,6 +47,31 @@ distinct ways**.
 22. [Troubleshooting](#22-troubleshooting)
 23. [Security notes](#23-security-notes)
 24. [Scope: what this repository is not](#24-scope-what-this-repository-is-not)
+
+**Part B — The observability stack**
+
+25. [Existing application architecture](#25-existing-application-architecture)
+26. [New observability architecture](#26-new-observability-architecture)
+27. [Why Prometheus](#27-why-prometheus)
+28. [Why Loki](#28-why-loki)
+29. [Why Grafana Alloy](#29-why-grafana-alloy)
+30. [Why Grafana](#30-why-grafana)
+31. [Why node_exporter](#31-why-node_exporter)
+32. [Port usage](#32-port-usage)
+33. [Docker network](#33-docker-network)
+34. [Starting the complete stack](#34-starting-the-complete-stack)
+35. [Stopping the stack](#35-stopping-the-stack)
+36. [Checking containers](#36-checking-containers)
+37. [Accessing Grafana](#37-accessing-grafana)
+38. [Grafana login](#38-grafana-login)
+39. [Prometheus verification](#39-prometheus-verification)
+40. [Loki verification](#40-loki-verification)
+41. [Alloy verification](#41-alloy-verification)
+42. [Application metrics verification](#42-application-metrics-verification)
+43. [Application log verification](#43-application-log-verification)
+44. [RCA failure scenario testing](#44-rca-failure-scenario-testing)
+45. [Observability troubleshooting](#45-observability-troubleshooting)
+46. [Future Grafana MCP integration](#46-future-grafana-mcp-integration)
 
 ---
 
@@ -82,52 +118,56 @@ application telemetry. To develop and grade that capability we need a target
 application where **the correct root cause is known in advance**. That is this
 repository.
 
-Phase 1 (this repo) prepares the environment. Phase 2 wires Grafana MCP into the
-LangGraph agent — no MCP, agent, or Grafana code lives here.
+Phase 1 (this repo) prepares the environment — application *and* observability
+stack. Phase 2 wires Grafana MCP into the LangGraph agent; no MCP or agent code
+lives here.
 
 ## 3. Architecture
 
-Phase-1 target environment on a single EC2 instance:
+Phase-1 environment on a single EC2 instance. Everything below runs from this
+repository's single `docker-compose.yml`:
 
 ```
                              AWS EC2
                                 |
                 +---------------+----------------+
                 |                                |
-          Test Application                  Observability stack
-          (this repository)                 (separate repository)
+          Application                       Observability
                 |                                |
-        +-------+-------+              +---------+---------+
-        |               |              |         |         |
-    /metrics        stdout logs    Prometheus  Alloy      Loki
-        |               |              ^         |         ^
-        |               +--------------|---------+---------+
-        |                              |
-        +------------------------------+
-                                       |
-                                    Grafana
-                                       |
-                                  Grafana MCP
-                                       |
-                              Phase 2: LangGraph RCA
+        +-------+-------+         +----------+---+-------+-----------+
+        |               |         |          |           |           |
+      nginx:80     test-rca-app  Prometheus Alloy       Loki    node-exporter
+        |               |         ^          |           ^           |
+        +---> app:8080 -+         |          |           |           |
+                        |         |          |           |           |
+                   /metrics ------+          |           |           |
+                        |                    |           |           |
+                   stdout logs --> json-file +---------> +           |
+                                                          |          |
+                                              Prometheus <-----------+
+                                                          |
+                                                       Grafana :3000
+                                                          |
+                                                   Grafana MCP
+                                                          |
+                                              Phase 2: LangGraph RCA
 ```
 
-Data flow out of this application:
+Data flow out of the application:
 
 | Path | Consumer |
 |---|---|
-| `GET /metrics` (HTTP pull) | Prometheus scrape |
+| `GET /metrics` (HTTP pull) | Prometheus scrape, via `test-rca-app:8080` |
 | stdout → Docker `json-file` log driver | Grafana Alloy → Loki |
 
-The app connects **out** to an external PostgreSQL database. Prometheus, Loki,
-Alloy, and Grafana are deliberately **not** in this repository's
-`docker-compose.yml` — they are a separate stack.
+The app connects **out** to an external PostgreSQL database. Full detail on the
+observability half is in [Part B](#26-new-observability-architecture).
 
 ## 4. Project structure
 
 ```
-test-rca-app/
-├── app/
+agentic-ai-test-env/
+├── app/                            # the application under test
 │   ├── __init__.py
 │   ├── main.py                  # app factory, lifespan, global error handler
 │   ├── config.py                # env-driven settings, credential redaction
@@ -153,8 +193,24 @@ test-rca-app/
 │   └── smoke_test.sh            # verify every endpoint + scenario
 ├── docs/
 │   └── failure-scenarios.md     # RCA reference for all four scenarios
+│
+├── prometheus/
+│   └── prometheus.yml           # scrape config (app + node-exporter + self)
+├── loki/
+│   └── loki-config.yml          # single-node Loki: filesystem + TSDB
+├── alloy/
+│   └── config.alloy             # Docker log discovery -> Loki
+├── grafana/
+│   └── provisioning/
+│       ├── datasources/
+│       │   └── datasources.yml  # Prometheus + Loki, auto-provisioned
+│       └── dashboards/
+│           ├── dashboards.yml   # dashboard provider
+│           └── test-rca-app-overview.json
+│
+├── nginx.conf                   # reverse proxy :80 -> app:8080
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml           # ONE file: app + nginx + full observability
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── pytest.ini
@@ -344,21 +400,18 @@ Stop:
 docker compose down
 ```
 
-The compose file runs **only the application**. It publishes `${APP_PORT:-8080}`,
-caps the container at 1.5 CPU / 512 MB (so CPU saturation is visible but
-bounded), and configures the `json-file` log driver with `service`,
-`environment`, and `component` labels for Alloy to promote into Loki labels.
+This one compose file runs the **whole environment**: Nginx, the application,
+and the observability stack. The application container is not published to the
+host at all — it is reached through Nginx on port 80 — and is capped at 1.5 CPU
+/ 512 MB, so CPU saturation is visible but bounded. Its `json-file` log driver
+carries `service`, `environment`, and `component` labels, which Alloy promotes
+into Loki labels.
 
-**Letting Prometheus scrape the app.** Either point Prometheus at the host port
-(`<EC2-private-IP>:8080`), or put both stacks on one Docker network:
-
-```bash
-docker network create observability
-```
-
-then uncomment the `networks` blocks in `docker-compose.yml`, add the same
-external network to the observability stack, and scrape
-`http://test-rca-app:8080/metrics` by container name.
+**Prometheus scrapes the app over the Docker network** at
+`http://test-rca-app:8080/metrics` — no host port and no EC2 public IP
+involved. Compose creates the shared `observability` network automatically;
+there is no `docker network create` step. See
+[Part B](#26-new-observability-architecture) for the full stack.
 
 ## 10. API endpoints
 
@@ -832,12 +885,646 @@ Check `docker compose ps` and use `rate()`/`increase()`, which handle resets.
 
 ## 24. Scope: what this repository is not
 
-Phase 1 is the target application only. Explicitly **not** here:
+Phase 1 is the test environment — the application **and** its observability
+stack. Explicitly **not** here:
 
 - Grafana MCP integration (Phase 2)
 - The LangGraph RCA agent, or any change to the Meyiconnect Agentic AI repo
 - A custom MCP server
-- Prometheus, Loki, Alloy, or Grafana deployment (separate observability stack)
 - Any CloudWatch or AWS SDK dependency — this app deliberately has none
-#   t e s t - r c a - a p p  
- # agentic-ai-test-env
+
+---
+
+# Part B — The observability stack
+
+Everything below was added to this same repository and the same
+`docker-compose.yml`. There is no second repository and no second compose file.
+
+## 25. Existing application architecture
+
+Unchanged by this work:
+
+```
+Internet → EC2 → Nginx :80 → test-rca-app :8080 → external PostgreSQL
+```
+
+- Nginx (`test-rca-nginx`) publishes **80:80** and reverse-proxies everything to
+  `app:8080` (see `nginx.conf`).
+- The application container (`test-rca-app`) publishes **no host port**; it is
+  reachable only through Nginx and over the Docker network.
+- The database is external and configured through `.env`.
+
+The application's API, ports, healthcheck, logging driver, metrics
+implementation, and failure scenarios were **not modified**. The only edit to
+the two existing services was joining the `observability` network.
+
+## 26. New observability architecture
+
+```
+                    ┌──────────────────────── EC2 ─────────────────────────┐
+                    │                                                      │
+ Internet ──:80──►  │  nginx ──► test-rca-app ──► external PostgreSQL      │
+ Internet ──:3000─► │  grafana                                             │
+                    │     │                                                │
+                    │     ├──► prometheus ──scrape──► test-rca-app:8080    │
+                    │     │          └───────scrape──► node-exporter:9100  │
+                    │     │                                                │
+                    │     └──► loki ◄──push── alloy ◄── Docker json-file   │
+                    └──────────────────────────────────────────────────────┘
+```
+
+Two independent telemetry paths, both over the Docker network:
+
+| Signal | Path |
+|---|---|
+| Metrics (app) | Prometheus **pulls** `http://test-rca-app:8080/metrics` every 15s |
+| Metrics (host) | Prometheus **pulls** `http://node-exporter:9100/metrics` |
+| Logs | app stdout → Docker `json-file` → Alloy tails → **pushes** to `http://loki:3100/loki/api/v1/push` |
+| Query | Grafana → `http://prometheus:9090` and `http://loki:3100` |
+
+Files added:
+
+```
+prometheus/prometheus.yml                                   # scrape config
+loki/loki-config.yml                                        # single-node Loki
+alloy/config.alloy                                          # Docker logs -> Loki
+grafana/provisioning/datasources/datasources.yml            # auto datasources
+grafana/provisioning/dashboards/dashboards.yml              # dashboard provider
+grafana/provisioning/dashboards/test-rca-app-overview.json  # RCA dashboard
+```
+
+## 27. Why Prometheus
+
+The application already exposed `/metrics`, but nothing was storing it — each
+scrape was a point-in-time snapshot with no history. An RCA agent cannot reason
+about an incident without a time series: "did database errors *increase*", "was
+latency *worse* than baseline", "when did this *start*". Prometheus provides
+that history and the PromQL to query it, and it is the metrics backend Grafana
+MCP will read through in Phase 2.
+
+Retention is 15 days (`--storage.tsdb.retention.time=15d`) — more than a test
+environment needs, and it keeps the volume small.
+
+## 28. Why Loki
+
+Metrics say *that* something broke; logs say *what* broke. The application's
+structured JSON logs already contain the decisive fields — `error_type`,
+`stack_trace`, `operation`, `db_target`, `duration_ms` — but they only lived in
+Docker's local log files: reachable one container at a time through
+`docker logs`, and not queryable over a time range.
+
+Loki makes them queryable with LogQL, and its label model matches the metric
+labels, so the agent can pivot from a Prometheus anomaly to the exact log lines
+in the same window. That is what turns "500s increased" into "`ValueError` at
+`app/routes/test_failures.py:145`".
+
+## 29. Why Grafana Alloy
+
+Something has to move logs from Docker into Loki. Alloy is Grafana's current
+collector — the **deprecated Grafana Agent is deliberately not used**.
+
+Alloy fits because it discovers containers through the Docker API rather than
+needing per-container configuration: new containers are picked up automatically,
+and the app keeps its existing `json-file` driver, so `docker logs test-rca-app`
+still works exactly as before. Alloy only reads; it changes nothing about how the
+application logs.
+
+## 30. Why Grafana
+
+Grafana is the single query surface over both datasources, and the only
+observability component exposed outside the host. Two reasons it matters here:
+
+1. **Phase 2 depends on it.** Grafana MCP talks to Grafana, not to Prometheus and
+   Loki directly. Provisioned datasources with stable UIDs (`prometheus`, `loki`)
+   are exactly what the MCP server will enumerate.
+2. **Human validation.** Before trusting an agent's RCA, a person needs to
+   confirm the telemetry actually tells the story. That is what the provisioned
+   dashboard is for.
+
+## 31. Why node_exporter
+
+The CPU-stress scenario is a *host* resource problem, and the application cannot
+credibly report on its own resource exhaustion. Its `/metrics` does expose
+`process_cpu_seconds_total` for its own process, but nothing about the EC2
+instance: total CPU across cores, memory pressure, disk fill, network
+throughput, or load average.
+
+node_exporter supplies the host view, which is what separates "the application is
+busy" from "the instance is saturated" — a distinction the RCA agent has to make.
+It needs three read-only host mounts to see the host rather than its own
+namespace:
+
+| Mount | Purpose |
+|---|---|
+| `/proc:/host/proc:ro` | CPU, memory, load, network counters |
+| `/sys:/host/sys:ro` | block devices, thermal, network device details |
+| `/:/rootfs:ro` | filesystem capacity/usage for real mountpoints |
+
+It also runs with `pid: host` for accurate host process metrics. It is **not**
+privileged and publishes **no host port**.
+
+## 32. Port usage
+
+| Service | Host binding | Reachable from | Notes |
+|---|---|---|---|
+| nginx | `80:80` | Internet | **Unchanged.** The application's only public entry point |
+| grafana | `3000:3000` | Internet | The observability UI |
+| prometheus | `127.0.0.1:9090:9090` | EC2 localhost only | Use an SSH tunnel |
+| loki | `127.0.0.1:3100:3100` | EC2 localhost only | Auth is disabled — must not be public |
+| alloy | *none* | Docker network only | Diagnostics on `:12345` inside the network |
+| node-exporter | *none* | Docker network only | Never publicly exposed |
+| test-rca-app | *none* | Docker network only | Through Nginx, as before |
+
+To reach Prometheus or Loki from a workstation, tunnel rather than publish:
+
+```bash
+ssh -L 9090:127.0.0.1:9090 -L 3100:127.0.0.1:3100 ubuntu@EC2_PUBLIC_IP
+```
+
+Security group: open **80** and **3000** only. Do not open 9090, 3100, or 9100.
+
+## 33. Docker network
+
+One Compose-managed bridge network, `observability`, shared by all seven
+services:
+
+```yaml
+networks:
+  observability:
+    driver: bridge
+```
+
+Compose creates it on `up` and removes it on `down` — **no `docker network
+create` step on EC2**, and it is not an external network. Every container
+resolves every other by name, which is why Prometheus can scrape
+`test-rca-app:8080` and Alloy can push to `loki:3100`.
+
+The app service also registers an explicit alias:
+
+```yaml
+networks:
+  observability:
+    aliases:
+      - test-rca-app
+```
+
+Docker already resolves `container_name`, but the alias means the Prometheus
+target keeps working even if `container_name` ever changes.
+
+## 34. Starting the complete stack
+
+```bash
+cd ~/agentic-ai-test-env
+git pull
+cp .env.example .env
+docker compose up -d --build
+```
+
+`cp .env.example .env` is first-time only — then edit it. Set at least
+`DATABASE_URL` and `GRAFANA_ADMIN_PASSWORD`, and keep
+`TRAFFIC_GENERATOR_ENABLED=true` so Prometheus and Loki always have a baseline.
+
+Startup takes about 30–45 seconds for everything to report healthy. The
+application does **not** wait for the observability stack — it has no
+`depends_on` pointing at it, so a broken Prometheus or Loki cannot stop the app
+from serving traffic.
+
+## 35. Stopping the stack
+
+```bash
+docker compose down
+```
+
+That stops all containers but **keeps** the named volumes
+(`prometheus_data`, `loki_data`, `grafana_data`, `alloy_data`) — verified. Other
+options:
+
+```bash
+docker compose stop              # just stop, keep containers
+docker compose restart grafana   # restart a single service
+```
+
+Only this deletes the data:
+
+```bash
+docker compose down -v           # DESTROYS metrics history, logs, dashboards
+```
+
+## 36. Checking containers
+
+```bash
+docker compose ps
+docker ps
+```
+
+Expected — seven containers:
+
+| Container | Expected status |
+|---|---|
+| `test-rca-nginx` | Up |
+| `test-rca-app` | Up (healthy) |
+| `prometheus` | Up (healthy) |
+| `loki` | Up (healthy) |
+| `grafana` | Up (healthy) |
+| `alloy` | Up |
+| `node-exporter` | Up |
+
+`alloy` and `node-exporter` show no health status because their images ship no
+healthcheck tooling; verify them through §41 and the Prometheus targets page
+instead.
+
+Logs for any component:
+
+```bash
+docker compose logs -f prometheus
+docker compose logs -f alloy
+docker logs test-rca-app
+```
+
+## 37. Accessing Grafana
+
+```
+http://EC2_PUBLIC_IP:3000
+```
+
+The provisioned dashboard is under **Dashboards → Meyiconnect RCA → "Meyiconnect
+RCA — Application & Host Overview"**, or directly:
+
+```
+http://EC2_PUBLIC_IP:3000/d/meyiconnect-rca-overview
+```
+
+Port 3000 must be open in the EC2 security group. Restrict it to your own IP
+range where possible.
+
+## 38. Grafana login
+
+Credentials come from `.env`, never from `docker-compose.yml`:
+
+```bash
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=CHANGE_ME
+```
+
+Change the password before deploying — this is the one publicly reachable
+observability endpoint. If unset, Grafana falls back to `admin`/`admin`.
+
+Sign-up is disabled (`GF_USERS_ALLOW_SIGN_UP=false`), so the admin account is the
+only way in.
+
+The Grafana container deliberately does **not** receive `.env` as an `env_file`;
+only the two `GRAFANA_*` variables are interpolated in. The PostgreSQL credential
+is never passed to Grafana, Prometheus, or Loki.
+
+Note that Grafana persists the password in `grafana_data` after first boot, so
+changing `GRAFANA_ADMIN_PASSWORD` later has no effect on an existing volume —
+reset it with `grafana-cli` inside the container, or recreate the volume.
+
+## 39. Prometheus verification
+
+```bash
+curl http://localhost:9090/-/ready
+```
+
+Expect `Prometheus Server is Ready.`
+
+Every scrape target and its health:
+
+```bash
+curl -s http://localhost:9090/api/v1/targets?state=active | python3 -m json.tool | grep -E '"job"|"health"|scrapeUrl'
+```
+
+Expect all five `up`:
+
+```
+alloy          http://alloy:12345/metrics         up
+loki           http://loki:3100/metrics           up
+node-exporter  http://node-exporter:9100/metrics  up
+prometheus     http://localhost:9090/metrics      up
+test-rca-app   http://test-rca-app:8080/metrics   up
+```
+
+Confirm it is scraping the app by Docker DNS rather than a host port or public
+IP:
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up{job="test-rca-app"}'
+```
+
+The Prometheus UI (through an SSH tunnel) is at `http://localhost:9090/targets`.
+
+## 40. Loki verification
+
+```bash
+curl http://localhost:3100/ready
+```
+
+Expect `ready`. For roughly the first 30 seconds after start it reports not
+ready, which is normal.
+
+Which labels arrived:
+
+```bash
+curl -s http://localhost:3100/loki/api/v1/labels
+```
+
+Expect `container`, `service`, `environment`, `component`, `project` (plus
+Loki's own `service_name` and `detected_level`).
+
+Which containers are shipping logs:
+
+```bash
+curl -s http://localhost:3100/loki/api/v1/label/container/values
+```
+
+Pull actual application log lines:
+
+```bash
+curl -s -G http://localhost:3100/loki/api/v1/query_range --data-urlencode 'query={service="test-rca-app"}' --data-urlencode 'limit=5'
+```
+
+## 41. Alloy verification
+
+Alloy publishes no host port, so check it from inside the network:
+
+```bash
+docker compose logs --tail 30 alloy
+docker exec alloy wget -qO- http://127.0.0.1:12345/metrics | head -20
+```
+
+The decisive test is whether logs are actually landing in Loki (§40). Prometheus
+also scrapes Alloy as job `alloy`, which shows whether the pipeline is healthy or
+silently stalled:
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(loki_write_sent_entries_total[5m]))'
+```
+
+Above zero means Alloy is actively delivering to Loki. Silence in Loki *plus*
+zero here points at Alloy or the Docker socket; silence in Loki with a non-zero
+value here points at Loki.
+
+## 42. Application metrics verification
+
+Through Nginx (unchanged behaviour):
+
+```bash
+curl http://localhost/metrics
+```
+
+Through Prometheus, confirming it stored them:
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_requests_total{job="test-rca-app"}[5m]))by(endpoint)'
+curl -s 'http://localhost:9090/api/v1/query?query=db_up{job="test-rca-app"}'
+```
+
+Host metrics:
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=node_load1{job="node-exporter"}'
+```
+
+Every dashboard panel uses a metric that actually exists — each expression was
+verified against Prometheus. Nothing is invented. `db_errors_total` is absent
+until the first database failure occurs, which is correct: a Prometheus counter
+only appears once it has been incremented.
+
+## 43. Application log verification
+
+The pipeline is `test-rca-app → Docker json-file → Alloy → Loki → Grafana`, and
+the first hop is unchanged:
+
+```bash
+docker logs test-rca-app --tail 5
+```
+
+```bash
+docker logs test-rca-app --tail 1 | python3 -m json.tool
+```
+
+Then in Loki, via Grafana **Explore → Loki**:
+
+```logql
+{service="test-rca-app"}
+{service="test-rca-app"} | json | level="ERROR"
+{service="test-rca-app"} | json | operation="select_users"
+{service="test-rca-app"} | json | duration_ms > 1000
+sum(count_over_time({service="test-rca-app"} | json | __error__="" [1m])) by (level)
+```
+
+Note the split: **labels** are the bounded stream selectors (`service`,
+`container`, `environment`, `component`, `project`, `stream`), while
+high-cardinality fields (`request_id`, `endpoint`, `error_type`, `duration_ms`)
+stay inside the JSON body and are filtered with `| json` after selection. That is
+deliberate — promoting `request_id` to a Loki label would create one stream per
+request and fall over.
+
+## 44. RCA failure scenario testing
+
+All four scenarios, driven through Nginx and observed in the stack. Let the
+baseline run about 10 minutes first.
+
+Drive **sustained** load rather than a single request: if a counter's entire jump
+happens between two scrapes, `rate()` and `increase()` legitimately report 0,
+because Prometheus has only ever seen that counter at its post-jump value.
+
+### Scenario 1 — database failure
+
+```bash
+curl -X POST "http://localhost/api/test/db-failure?enable=true&mode=connection_refused"
+```
+
+```bash
+for i in $(seq 1 60); do curl -s -o /dev/null http://localhost/api/users; curl -s -o /dev/null http://localhost/api/orders; sleep 1; done
+```
+
+```bash
+curl -X POST "http://localhost/api/test/db-failure?enable=false"
+```
+
+Prometheus:
+
+```promql
+sum(rate(db_errors_total{job="test-rca-app"}[2m])) by (operation, error_type)
+sum(rate(http_requests_total{job="test-rca-app",status="503"}[2m])) by (endpoint)
+db_up{job="test-rca-app"}
+```
+
+Loki:
+
+```logql
+{service="test-rca-app"} | json | error_type="connection_refused"
+```
+
+Measured during validation: `db_errors_total` for `select_users` reached 145
+while `http_requests_total{endpoint="/api/users",status="503"}` also reached 145
+— the two move in exact lockstep, which is the correlation the agent needs.
+
+### Scenario 2 — CPU stress
+
+```bash
+curl "http://localhost/api/cpu-stress?duration=60"
+```
+
+Prometheus:
+
+```promql
+100 - (avg(rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[1m])) * 100)
+sum(rate(process_cpu_seconds_total{job="test-rca-app"}[1m])) * 100
+```
+
+Loki:
+
+```logql
+{service="test-rca-app"} | json | scenario="cpu_stress"
+```
+
+Measured: host CPU peaked at 41.7% and app process CPU at 31.8% during a 15s
+run, with "CPU stress started" and "CPU stress completed" bracketing the window
+in Loki.
+
+### Scenario 3 — application error
+
+```bash
+for i in $(seq 1 30); do curl -s -o /dev/null http://localhost/api/error; sleep 1; done
+```
+
+Prometheus — the 500s stay scoped to one endpoint, and `db_errors_total` does not
+move:
+
+```promql
+sum(rate(http_requests_total{job="test-rca-app",status="500"}[2m])) by (endpoint)
+```
+
+Loki — the stack trace is the attribution:
+
+```logql
+{service="test-rca-app"} | json | error_type="SimulatedApplicationError"
+```
+
+### Scenario 4 — database latency
+
+```bash
+for i in $(seq 1 12); do curl -s -o /dev/null "http://localhost/api/slow-query?seconds=10"; done
+```
+
+Prometheus:
+
+```promql
+histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket{job="test-rca-app"}[5m])) by (le, operation))
+```
+
+Loki:
+
+```logql
+{service="test-rca-app"} | json | operation="slow_query"
+```
+
+The four scenarios stay distinguishable on metrics alone; the full matrix is in
+[§18](#18-expected-prometheus-signals) and
+[docs/failure-scenarios.md](docs/failure-scenarios.md).
+
+## 45. Observability troubleshooting
+
+**Prometheus target `test-rca-app` is DOWN.**
+Check both containers are on the `observability` network, then test resolution
+from inside Prometheus:
+
+```bash
+docker inspect test-rca-app --format '{{json .NetworkSettings.Networks}}'
+```
+
+```bash
+docker exec prometheus wget -qO- http://test-rca-app:8080/health
+```
+
+If the name does not resolve, the app service is missing the network or the
+alias. Never "fix" this by switching the target to an EC2 IP or `localhost` —
+inside the Prometheus container, `localhost` is Prometheus.
+
+**No logs in Loki at all.**
+Work the pipeline in order — app, then Alloy, then Loki:
+
+```bash
+docker logs test-rca-app --tail 3
+```
+
+```bash
+docker compose logs --tail 30 alloy
+```
+
+```bash
+docker exec alloy wget -qO- http://loki:3100/ready
+```
+
+```bash
+curl -s http://localhost:3100/loki/api/v1/label/container/values
+```
+
+The usual cause is Alloy being unable to read `/var/run/docker.sock`.
+
+**Alloy restarts, or logs "permission denied" on the Docker socket.**
+The socket is root-owned on the host, which is why Alloy runs as `root`. Confirm:
+
+```bash
+docker inspect alloy --format '{{.Config.User}} {{json .Mounts}}'
+```
+
+If you switched Alloy to non-root, add the host's docker group gid with
+`group_add` instead.
+
+**Loki rejects entries as too old.**
+`reject_old_samples_max_age` is 168h, so logs older than 7 days are dropped.
+Expected after a long container downtime; not a fault.
+
+**Grafana shows "Datasource not found" on the dashboard.**
+The dashboard references datasources by uid (`prometheus`, `loki`). If they were
+renamed or hand-edited, re-provision and check:
+
+```bash
+docker compose restart grafana
+```
+
+```bash
+curl -s -u admin:YOUR_PASSWORD http://localhost:3000/api/datasources
+```
+
+**node-exporter metrics missing or implausible.**
+It needs the three read-only host mounts and only reports meaningfully on a Linux
+host. On Docker Desktop for Windows/macOS it reports the Linux VM, not your
+workstation.
+
+**Panels empty but all targets up.**
+Either no traffic is being generated (set `TRAFFIC_GENERATOR_ENABLED=true`, or
+run `scripts/generate_traffic.sh`), or the counter has not been incremented yet —
+`db_errors_total` genuinely does not exist until the first database failure.
+
+**Metrics reset to zero.**
+The app container restarted; prometheus-client keeps counters in process memory.
+Use `rate()` / `increase()`, which handle counter resets.
+
+## 46. Future Grafana MCP integration
+
+Out of scope for Phase 1 — no MCP code is in this repository. What Phase 2 will
+attach to:
+
+```
+LangGraph RCA Agent → Grafana MCP → Grafana → Prometheus (metrics)
+                                            → Loki       (logs)
+```
+
+Phase 1 deliberately leaves it ready:
+
+- Grafana is reachable on a stable port with provisioned datasources at fixed
+  UIDs (`prometheus`, `loki`), which is what an MCP server enumerates.
+- Both telemetry paths are verified end to end, so a Phase-2 failure can be
+  attributed to the agent or to MCP rather than to missing data.
+- Metric and log labels are low-cardinality and consistent, so the agent can
+  correlate a metric anomaly with log evidence in the same window.
+- All four failure scenarios have a **known correct root cause**, so the agent's
+  RCA output can be graded rather than merely inspected.
+
+When Phase 2 starts, the likely additions are a Grafana service account token for
+MCP authentication and MCP server configuration in the Meyiconnect Agentic AI
+repository — not here.

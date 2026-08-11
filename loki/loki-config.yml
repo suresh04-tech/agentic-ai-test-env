@@ -1,0 +1,76 @@
+# Single-node Loki for the Phase-1 test environment.
+#
+# Deliberately simple: filesystem storage, TSDB schema, replication factor 1,
+# auth disabled. This is an internal test environment reachable only from the
+# Docker network and 127.0.0.1 on the EC2 host — never expose it publicly with
+# auth_enabled: false.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+# TSDB with schema v13 — the current Loki index format.
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  metric_aggregation_enabled: false
+  # Enables the log-volume panel in Grafana's Explore view, which is how you
+  # eyeball "did error volume spike during the incident".
+  volume_enabled: true
+  retention_period: 168h        # 7 days is plenty for a test environment
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  max_query_series: 5000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: true
+
+compactor:
+  working_directory: /loki/compactor
+  delete_request_store: filesystem
+  retention_enabled: true
+  compaction_interval: 10m
+  retention_delete_delay: 2h
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  enable_api: true
+
+# No phone-home from a test environment.
+analytics:
+  reporting_enabled: false
