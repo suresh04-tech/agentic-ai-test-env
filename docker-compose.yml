@@ -7,6 +7,17 @@
 # The app's PostgreSQL database is external; configure it in .env.
 
 services:
+  nginx:
+    image: nginx:alpine
+    container_name: test-rca-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+
   app:
     build: .
     image: test-rca-app:latest
@@ -17,10 +28,8 @@ services:
     # Nothing sensitive is committed — see .env.example.
     env_file:
       - .env
-
-    ports:
-      # Host port is configurable so it can sit alongside other services.
-      - "${APP_PORT:-8080}:8080"
+    # App port is no longer exposed directly to the host, 
+    # it is accessed through the nginx reverse proxy.
 
     # Docker's json-file driver writes container stdout to disk, which is what
     # Grafana Alloy tails and forwards to Loki. The labels below give Alloy
