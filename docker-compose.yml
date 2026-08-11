@@ -1,0 +1,70 @@
+# Application only.
+#
+# Prometheus, Loki, Alloy and Grafana are deliberately NOT here — they are
+# maintained as a separate observability stack. This compose file just runs the
+# app and makes it scrapeable.
+#
+# The app's PostgreSQL database is external; configure it in .env.
+
+services:
+  app:
+    build: .
+    image: test-rca-app:latest
+    container_name: test-rca-app
+    restart: unless-stopped
+
+    # All configuration (including the database connection) comes from .env.
+    # Nothing sensitive is committed — see .env.example.
+    env_file:
+      - .env
+
+    ports:
+      # Host port is configurable so it can sit alongside other services.
+      - "${APP_PORT:-8080}:8080"
+
+    # Docker's json-file driver writes container stdout to disk, which is what
+    # Grafana Alloy tails and forwards to Loki. The labels below give Alloy
+    # stable metadata to promote into Loki labels.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+        labels: "service,environment,component"
+
+    labels:
+      service: "test-rca-app"
+      environment: "${APP_ENV:-test}"
+      component: "application"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # /api/cpu-stress is bounded, but a cpu limit keeps the blast radius on the
+    # EC2 instance predictable while still letting CPU saturation show up in
+    # Prometheus.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 512M
+
+# If you prefer Prometheus to scrape the app over a Docker network instead of
+# the host port, create the network once on the EC2 host:
+#
+#     docker network create observability
+#
+# then uncomment the two blocks below and add the same external network to the
+# observability stack's compose file. Prometheus can then scrape
+# http://test-rca-app:8080/metrics by container name.
+#
+#     networks:
+#       - observability
+#
+# networks:
+#   observability:
+#     external: true

@@ -1,0 +1,10 @@
+# Normalise line endings so a clone on the EC2 host is always usable.
+* text=auto eol=lf
+
+# These MUST be LF: CRLF breaks the shebang on Linux
+# ("bad interpreter: /usr/bin/env bash^M") and breaks Docker builds.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.py        text eol=lf
+.env.example text eol=lf
