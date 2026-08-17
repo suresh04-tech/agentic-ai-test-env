@@ -209,8 +209,12 @@ services:
     image: grafana/grafana:11.5.2
     container_name: grafana
     restart: unless-stopped
+    # No longer published to the public internet: nginx reaches Grafana over the
+    # `observability` network by name (http://grafana:3000). Bound to localhost
+    # only so it stays reachable via SSH tunnel for debugging, but nobody can
+    # bypass Cloudflare/nginx by hitting the EC2 IP on :3000.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     # NOTE: intentionally NOT `env_file: .env` — that file holds the external
     # PostgreSQL credential, which must never be injected into Grafana. Only
     # the two Grafana variables are interpolated from .env by Compose.
@@ -221,6 +225,11 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_LOG_LEVEL: "info"
+      # Public URL Grafana lives behind (Cloudflare -> nginx -> grafana). Needed
+      # so login redirects, OAuth callbacks and generated links use the right
+      # host+scheme. >>> Replace grafana.example.com with your real subdomain <<<
+      GF_SERVER_ROOT_URL: "https://grafana.cybertechmind.com/"
+      GF_SERVER_DOMAIN: "grafana.cybertechmind.com"
     volumes:
       # Persists users, settings, and any UI-created dashboards.
       - grafana_data:/var/lib/grafana
