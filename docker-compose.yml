@@ -227,7 +227,7 @@ services:
       GF_LOG_LEVEL: "info"
       # Public URL Grafana lives behind (Cloudflare -> nginx -> grafana). Needed
       # so login redirects, OAuth callbacks and generated links use the right
-      # host+scheme. >>> Replace grafana.example.com with your real subdomain <<<
+      # host+scheme.
       GF_SERVER_ROOT_URL: "https://grafana.cybertechmind.com/"
       GF_SERVER_DOMAIN: "grafana.cybertechmind.com"
     volumes:
