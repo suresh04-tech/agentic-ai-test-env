@@ -1,0 +1,117 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# ${project_name} / ${environment} — Amazon Linux 2023 bootstrap
+#
+# Bundle revision: ${bundle_key}
+# Changing the application code changes this file, which replaces the instance.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+exec > >(tee -a /var/log/bootstrap.log) 2>&1
+
+APP_DIR=/opt/app
+REGION="${aws_region}"
+
+echo "[bootstrap] starting at $(date -Is)"
+
+# --- packages -------------------------------------------------------------
+dnf -y update
+dnf -y install docker unzip tar amazon-cloudwatch-agent
+
+if ! command -v aws >/dev/null 2>&1; then
+  dnf -y install awscli-2 || dnf -y install aws-cli
+fi
+
+systemctl enable --now docker
+
+# --- docker compose v2 CLI plugin ----------------------------------------
+COMPOSE_DIR=/usr/local/lib/docker/cli-plugins
+mkdir -p "$COMPOSE_DIR"
+
+case "$(uname -m)" in
+  x86_64)  COMPOSE_ARCH=x86_64  ;;
+  aarch64) COMPOSE_ARCH=aarch64 ;;
+  *) echo "[bootstrap] unsupported architecture $(uname -m)"; exit 1 ;;
+esac
+
+curl -fsSL --retry 5 --retry-delay 3 \
+  "https://github.com/docker/compose/releases/download/${docker_compose_version}/docker-compose-linux-$COMPOSE_ARCH" \
+  -o "$COMPOSE_DIR/docker-compose"
+chmod 0755 "$COMPOSE_DIR/docker-compose"
+docker compose version
+
+# --- CloudWatch agent -----------------------------------------------------
+# Started before the app so the boot logs of the first deploy are captured.
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c "ssm:${cw_agent_parameter}"
+
+# --- application bundle ---------------------------------------------------
+install -d -m 0755 "$APP_DIR"
+aws s3 cp "s3://${artifact_bucket}/${bundle_key}" /tmp/app.zip --region "$REGION"
+unzip -oq /tmp/app.zip -d "$APP_DIR"
+rm -f /tmp/app.zip
+chmod +x "$APP_DIR"/scripts/*.sh 2>/dev/null || true
+
+# --- .env -----------------------------------------------------------------
+# Non-secret settings come from Terraform; the two secrets are pulled from
+# Parameter Store at boot so neither ever appears in user data or in the logs.
+umask 077
+cat > "$APP_DIR/.env" <<'ENV_NON_SECRET'
+${app_env_block}
+ENV_NON_SECRET
+
+set +x
+DB_URL="$(aws ssm get-parameter --name '${ssm_db_url}' --with-decryption \
+  --region "$REGION" --query 'Parameter.Value' --output text)"
+GF_PASSWORD="$(aws ssm get-parameter --name '${ssm_grafana_password}' --with-decryption \
+  --region "$REGION" --query 'Parameter.Value' --output text)"
+
+printf 'DATABASE_URL=%s\n'           "$DB_URL"      >> "$APP_DIR/.env"
+printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$GF_PASSWORD" >> "$APP_DIR/.env"
+unset DB_URL GF_PASSWORD
+
+chmod 0600 "$APP_DIR/.env"
+umask 022
+
+# --- bring the stack up ---------------------------------------------------
+cd "$APP_DIR"
+docker compose up -d --build --remove-orphans
+
+# Compose services use `restart: unless-stopped`, so Docker restarts them after
+# a reboot. This unit additionally reconciles the stack against the compose file
+# on boot, which also recovers containers that were manually stopped.
+cat > /etc/systemd/system/app-stack.service <<'UNIT'
+[Unit]
+Description=${project_name} docker compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/app
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable app-stack.service
+
+# --- wait for the app to answer ------------------------------------------
+echo "[bootstrap] waiting for http://127.0.0.1/health"
+for attempt in $(seq 1 60); do
+  if curl -fsS http://127.0.0.1/health >/dev/null 2>&1; then
+    echo "[bootstrap] healthy after $attempt attempt(s)"
+    break
+  fi
+  sleep 5
+done
+
+curl -fsS http://127.0.0.1/health || echo "[bootstrap] WARNING: /health did not answer in time"
+docker compose ps
+
+echo "[bootstrap] finished at $(date -Is)"

@@ -1,0 +1,64 @@
+####################################################################
+# Copy to terraform.tfvars and fill in real values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is gitignored and must NEVER be committed.
+# Every value below is a placeholder.
+####################################################################
+
+aws_region   = "<REGION>"
+project_name = "test-rca-app"
+environment  = "test"
+
+# ------------------------------------------------------------------
+# REQUIRED - external PostgreSQL. Managed Postgres (RDS with TLS
+# enforced, Render, Neon, ...) normally needs ?sslmode=require.
+# Stored as an SSM SecureString, never in EC2 user data.
+# ------------------------------------------------------------------
+database_url = "postgresql://<DB_USER>:<DB_PASSWORD>@<DB_HOST>:5432/<DB_NAME>?sslmode=require"
+
+# REQUIRED - minimum 12 characters.
+grafana_admin_user     = "admin"
+grafana_admin_password = "<GRAFANA_ADMIN_PASSWORD>"
+
+# ------------------------------------------------------------------
+# Compute
+# ------------------------------------------------------------------
+instance_type    = "t3.medium"
+root_volume_size = 30
+
+# Leave key_pair_name unset and use SSM Session Manager instead:
+#   aws ssm start-session --target <instance-id>
+# key_pair_name     = "<KEY_PAIR_NAME>"
+# ssh_allowed_cidrs = ["<YOUR_OFFICE_IP>/32"]
+
+# ------------------------------------------------------------------
+# Load balancer
+# ------------------------------------------------------------------
+# Restrict this to known CIDRs if the environment is not meant to be public.
+alb_allowed_cidrs = ["0.0.0.0/0"]
+
+# Set an ACM cert ARN in the same region to get HTTPS:443 with an
+# HTTP -> HTTPS redirect. Leave unset for plain HTTP:80.
+# acm_certificate_arn = "arn:aws:acm:<REGION>:<ACCOUNT_ID>:certificate/<CERT_ID>"
+
+# ------------------------------------------------------------------
+# CloudWatch
+# ------------------------------------------------------------------
+log_retention_days     = 14
+cpu_alarm_threshold    = 80
+memory_alarm_threshold = 85
+disk_alarm_threshold   = 85
+
+# Confirm the AWS subscription email before alarms deliver.
+# alarm_email = "<ALERTS_EMAIL>"
+
+# ------------------------------------------------------------------
+# Override any non-secret entry of /opt/app/.env here.
+# Do not put DATABASE_URL or GRAFANA_ADMIN_PASSWORD in this map.
+# ------------------------------------------------------------------
+# app_settings = {
+#   LOG_LEVEL                 = "DEBUG"
+#   TRAFFIC_GENERATOR_ENABLED = "false"
+#   ENABLE_TEST_CONTROLS      = "false"
+# }

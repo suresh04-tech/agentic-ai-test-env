@@ -1,0 +1,20 @@
+# Terraform working files - never commit
+.terraform/
+.build/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# Holds DATABASE_URL and the Grafana password
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example

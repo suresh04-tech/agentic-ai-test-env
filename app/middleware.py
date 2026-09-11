@@ -30,6 +30,13 @@ logger = get_logger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
+# Endpoints whose successful responses are NOT written to the access log.
+# These are hit automatically by the ALB health checker (every 30 s) and
+# Prometheus scraper (every 60 s) — logging them fills CloudWatch with noise
+# and inflates ingestion costs without adding any diagnostic value.
+# Errors on these paths ARE still logged (the >= 500 branch below runs normally).
+SILENT_PATHS = frozenset({"/health", "/ready", "/metrics"})
+
 
 def _endpoint_label(request: Request) -> str:
     route = request.scope.get("route")
@@ -110,6 +117,11 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             else:
                 log = logger.info
                 message = "Request completed"
+
+            # Skip the access log line for successful probe endpoints.
+            # Metrics above are still recorded so ALB health and Prometheus work.
+            if request.url.path in SILENT_PATHS and response.status_code < 400:
+                return response
 
             log(
                 message,
