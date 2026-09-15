@@ -285,3 +285,29 @@ resource "aws_cloudwatch_metric_alarm" "db_connection_timeout_rate" {
 
   depends_on = [aws_cloudwatch_log_metric_filter.db_connection_timeouts]
 }
+
+# ---------------------------------------------------------------------------
+# RDS CPU Utilization Alarm
+#
+# Fires when the RDS instance CPU utilization is >= 50%.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
+  alarm_name          = "${local.name_prefix}-rds-cpu-high"
+  alarm_description   = "RDS CPU utilization is >= 50%"
+  namespace           = "AWS/RDS"
+  metric_name         = "CPUUtilization"
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 50
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.postgres.identifier
+  }
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+}
