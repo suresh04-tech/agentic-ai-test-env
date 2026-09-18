@@ -63,6 +63,13 @@ output "alarm_names" {
   value = [
     aws_cloudwatch_metric_alarm.unhealthy_hosts.alarm_name,
     aws_cloudwatch_metric_alarm.app_error_rate.alarm_name,
+    aws_cloudwatch_metric_alarm.db_connection_timeout_rate.alarm_name,
+    aws_cloudwatch_metric_alarm.rds_cpu.alarm_name,
+    # Lambda → RDS connection exhaustion scenario
+    aws_cloudwatch_metric_alarm.lambda_errors.alarm_name,
+    aws_cloudwatch_metric_alarm.lambda_duration_p95.alarm_name,
+    aws_cloudwatch_metric_alarm.rds_connections_high.alarm_name,
+    aws_cloudwatch_metric_alarm.rds_cpu_conn_exhaust.alarm_name,
   ]
 }
 
@@ -98,4 +105,39 @@ output "rds_username" {
 output "rds_connection_string_ssm_param" {
   description = "SSM Parameter Store path that holds the DATABASE_URL SecureString (fetch with --with-decryption)."
   value       = aws_ssm_parameter.database_url.name
+}
+
+# ---------------------------------------------------------------------------
+# Lambda → RDS Connection Exhaustion Scenario outputs
+# ---------------------------------------------------------------------------
+
+output "lambda_function_url" {
+  description = "HTTPS Function URL for the conn-exhaust Lambda. Hit this with ab/curl to trigger the scenario."
+  value       = aws_lambda_function_url.conn_exhaust.function_url
+}
+
+output "lambda_function_name" {
+  description = "Lambda function name (use in CloudWatch console filter)."
+  value       = aws_lambda_function.conn_exhaust.function_name
+}
+
+output "lambda_trigger_commands" {
+  description = "Copy-paste commands to trigger the connection-exhaustion scenario."
+  value = {
+    single_request  = "curl -sS \"$${aws_lambda_function_url_conn_exhaust_function_url}\""
+    load_test_linux = "ab -n 500 -c 60 \"$${aws_lambda_function_url_conn_exhaust_function_url}\""
+    load_test_ps    = "1..60 | ForEach-Object -Parallel { Invoke-WebRequest -Uri '$${aws_lambda_function_url_conn_exhaust_function_url}' -UseBasicParsing } -ThrottleLimit 60"
+    note            = "Replace the placeholder above with the actual lambda_function_url output value."
+  }
+}
+
+resource "terraform_data" "debug_policy" {
+  triggers_replace = [ timestamp() ]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    command     = <<-EOF
+      aws lambda get-policy --function-name "${aws_lambda_function.conn_exhaust.function_name}" > lambda_policy.json || true
+    EOF
+  }
 }

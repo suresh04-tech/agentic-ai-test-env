@@ -325,6 +325,46 @@ def run_slow_query(session: Session, seconds: float) -> float:
     return seconds
 
 
+def run_db_stress(session: Session, duration_seconds: float, batch_size: int = 500_000) -> tuple[float, int]:
+    """Burn CPU on the database server for approximately ``duration_seconds``.
+
+    Runs a tight loop of compute-heavy ``generate_series`` + math queries
+    directly on PostgreSQL so that RDS CPU utilization rises noticeably —
+    useful for triggering CloudWatch high-CPU alarms in a controlled test.
+
+    The query is read-only, self-terminating, and lock-free:
+
+    ``SELECT sum(sqrt(i::float) * sin(i::float)) FROM generate_series(1, N) t(i)``
+
+    Each iteration fires one query with ``batch_size`` rows.  The loop stops as
+    soon as the wall-clock deadline passes, so the scenario is always bounded.
+
+    Returns ``(actual_duration_seconds, iteration_count)``.
+    """
+    dialect = session.bind.dialect.name if session.bind is not None else "unknown"
+    deadline = time.monotonic() + duration_seconds
+    started = time.perf_counter()
+    iterations = 0
+
+    while time.monotonic() < deadline:
+        with tracked_db_operation("db_stress_batch", slow_threshold_seconds=2.0):
+            if dialect == "postgresql":
+                session.execute(
+                    text(
+                        "SELECT sum(sqrt(i::float) * sin(i::float)) "
+                        "FROM generate_series(1, :n) t(i)"
+                    ),
+                    {"n": batch_size},
+                )
+            else:
+                # SQLite fallback for unit tests — approximate with a short sleep.
+                time.sleep(min(0.05, duration_seconds))
+                session.execute(text("SELECT 1")).scalar_one()
+        iterations += 1
+
+    return time.perf_counter() - started, iterations
+
+
 # ---------------------------------------------------------------------------
 # Schema init + seed
 # ---------------------------------------------------------------------------

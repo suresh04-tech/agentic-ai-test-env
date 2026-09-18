@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
-# Latency buckets deliberately reach well past 10s: /api/slow-query and
-# /api/cpu-stress are meant to land in the tail, and the RCA agent needs to see
-# that tail rather than a saturated +Inf bucket.
+# Latency buckets deliberately reach well past 10s: /api/slow-query,
+# /api/cpu-stress and /api/db-stress are meant to land in the tail, and the
+# RCA agent needs to see that tail rather than a saturated +Inf bucket.
 LATENCY_BUCKETS = (
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
     2.5, 5.0, 10.0, 15.0, 30.0, 60.0,
@@ -126,6 +126,21 @@ app_simulated_failures_total = Counter(
 app_db_failure_simulation_active = Gauge(
     "app_db_failure_simulation_active",
     "Whether database-failure simulation is currently enabled (1 = enabled).",
+)
+
+app_db_stress_runs_total = Counter(
+    "app_db_stress_runs_total",
+    "Completed RDS CPU stress runs.",
+)
+
+app_db_stress_seconds_total = Counter(
+    "app_db_stress_seconds_total",
+    "Cumulative wall-clock seconds spent executing RDS CPU stress queries.",
+)
+
+app_db_stress_active = Gauge(
+    "app_db_stress_active",
+    "RDS CPU stress runs currently in flight.",
 )
 
 app_info = Gauge(

@@ -1,0 +1,10 @@
+# Lambda dependencies for connection_exhaust_handler.py
+#
+# Deliberately minimal:
+#   - psycopg (v3) with the binary build for PostgreSQL access
+#   - No SQLAlchemy, no connection pool, no pgbouncer — that is the anti-pattern.
+#
+# Packaged into the Lambda deployment zip by lambda.tf using pip install -t.
+
+psycopg[binary]==3.2.3
+typing_extensions

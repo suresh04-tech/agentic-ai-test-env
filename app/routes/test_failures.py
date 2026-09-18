@@ -29,6 +29,7 @@ from app.config import Settings, get_settings
 from app.database import (
     get_db,
     get_failure_state,
+    run_db_stress,
     run_slow_query,
     set_db_failure,
 )
@@ -37,6 +38,9 @@ from app.metrics import (
     app_cpu_stress_active,
     app_cpu_stress_runs_total,
     app_cpu_stress_seconds_total,
+    app_db_stress_active,
+    app_db_stress_runs_total,
+    app_db_stress_seconds_total,
     app_simulated_failures_total,
     app_slow_queries_total,
 )
@@ -275,6 +279,132 @@ async def cpu_stress(
         "actual_seconds": round(actual, 3),
         "iterations": iterations,
         "max_allowed_seconds": settings.cpu_stress_max_duration,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5: RDS / database CPU stress
+# ---------------------------------------------------------------------------
+
+# Concurrency cap: at most one slot per CPU core, same discipline as
+# the app-side CPU stress scenario.
+_DB_STRESS_SLOTS = max(1, os.cpu_count() or 1)
+_db_stress_semaphore = threading.BoundedSemaphore(_DB_STRESS_SLOTS)
+
+
+@router.get("/api/database", summary="Scenario 5 — bounded RDS CPU stress")
+async def db_stress(
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    duration: int = Query(
+        10,
+        description="Seconds of CPU load to generate on the database server.",
+    ),
+    batch_size: int = Query(
+        500_000,
+        description=(
+            "Number of generate_series rows per query iteration. "
+            "Higher values increase per-query CPU cost. Default: 500000."
+        ),
+    ),
+) -> dict:
+    """Drive CPU utilisation on the RDS / PostgreSQL instance.
+
+    Runs a loop of ``SELECT sum(sqrt(i::float) * sin(i::float)) FROM
+    generate_series(1, batch_size) t(i)`` queries against the database for
+    ``duration`` seconds. The query is read-only, lock-free, and
+    self-terminating — safe to run against a production-class RDS instance
+    while testing CloudWatch high-CPU alarms.
+    """
+    if duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_duration", "message": "duration must be > 0"},
+        )
+    if duration > settings.cpu_stress_max_duration:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "duration_out_of_range",
+                "message": (
+                    f"duration must be <= {settings.cpu_stress_max_duration} seconds "
+                    "(CPU_STRESS_MAX_DURATION)"
+                ),
+            },
+        )
+    if batch_size < 1 or batch_size > 10_000_000:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_batch_size",
+                "message": "batch_size must be between 1 and 10000000",
+            },
+        )
+
+    if not _db_stress_semaphore.acquire(blocking=False):
+        logger.warning(
+            "DB stress rejected: all stress slots busy",
+            extra={
+                "operation": "db_stress",
+                "scenario": "db_stress",
+                "detail": f"max_concurrent={_DB_STRESS_SLOTS}",
+            },
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "db_stress_busy",
+                "message": (
+                    f"At most {_DB_STRESS_SLOTS} concurrent DB stress runs are "
+                    "allowed; try again shortly."
+                ),
+            },
+        )
+
+    app_db_stress_active.inc()
+    logger.warning(
+        "DB stress started",
+        extra={
+            "operation": "db_stress",
+            "scenario": "db_stress",
+            "requested_duration_s": duration,
+            "batch_size": batch_size,
+        },
+    )
+    try:
+        actual, iterations = await run_in_threadpool(
+            run_db_stress, session, float(duration), batch_size
+        )
+    except Exception as exc:
+        raise db_http_exception(exc, "db_stress") from exc
+    finally:
+        app_db_stress_active.dec()
+        _db_stress_semaphore.release()
+
+    app_db_stress_runs_total.inc()
+    app_db_stress_seconds_total.inc(actual)
+    logger.warning(
+        "DB stress completed",
+        extra={
+            "operation": "db_stress",
+            "scenario": "db_stress",
+            "status": "success",
+            "requested_duration_s": duration,
+            "actual_duration_s": round(actual, 3),
+            "duration_ms": round(actual * 1000, 2),
+            "iterations": iterations,
+            "batch_size": batch_size,
+            "db_target": settings.safe_database_target,
+        },
+    )
+    return {
+        "scenario": "db_stress",
+        "requested_seconds": duration,
+        "actual_seconds": round(actual, 3),
+        "iterations": iterations,
+        "batch_size": batch_size,
+        "max_allowed_seconds": settings.cpu_stress_max_duration,
+        "note": "Read-only generate_series math queries executed on the database server.",
     }
 
 
